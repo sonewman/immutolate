@@ -1,0 +1,7 @@
+{
+  "laxcomma": true
+  , "laxbreak": true
+  , "expr": true
+  , "esnext": true
+  , "eqnull": true
+}
