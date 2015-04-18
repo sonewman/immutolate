@@ -1,76 +1,54 @@
 /**
  * @exports
  */
-module.exports = exports = fromJS;
+module.exports = exports = isolateFromJS;
 exports.Isolate = Isolate;
 exports.ArrayIsolate = ArrayIsolate;
 
 var Immutable = require('immutable');
+var ImmutableFromJS = Immutable.fromJS;
 var isList = Immutable.List.isList;
 var Iterable = Immutable.Iterable;
 var isIterable = Iterable.isIterable;
 
-var utils = require('./utils');
-var Update = utils.Update;
-var Construct = utils.Construct;
-var handlePath = utils.handlePath;
+var IsolateState = require('./lib/state');
 
-function fromJS(value, root, path) {
+function isolateFromJS(value, root, path) {
   var proto = Array.isArray(value) || isList(value)
     ? ArrayIsolateProto
     : IsolateProto;
-  
+
   return Construct(proto, value, root, path);
 }
 
 /**
- * @class Listener
  * @private
  */
-function Listener(keyPath) {
-  this.keyPath = keyPath;
-  this.handlers = [];
+var hasNumbers = /\d+/;
+function handlePath(path) {
+  if (Array.isArray(path)) return path;
+  return (path || '').split('.').reduce(function (keyPath, key) {
+    key = hasNumbers.test(key) ? parseInt(key) : key;
+    if (key || key === 0) keyPath.push(key);
+    return keyPath;
+  }, []);
 }
 
-var ArrayIsolateProto = Object.create(Isolate.prototype);
 /**
- * @class ArrayIsolate
+ * @description construct Isolate from a given proto
  */
-function ArrayIsolate(value, root, path) {
-  return Construct(ArrayIsolateProto, value, root, path);
-}
-ArrayIsolate.prototype = ArrayIsolateProto;
+function Construct(Proto, value, root, path) {
+  value = ImmutableFromJS(value);
+  if (!isIterable(value)) return value;
 
-ArrayIsolate.isArrayIsolate = function (o) {
-  return o instanceof ArrayIsolate;
-};
-ArrayIsolateProto.constructor = ArrayIsolate;
-
-ArrayIsolateProto.toString = function () {
-  return 'ArrayIsolate [' + isolateToString(this) + ' ]';
-};
-
-ArrayIsolateProto.push = function (/* values */) {
+  var isolate = Object.create(Proto);
   
-};
-
-function pop_(old) {
-  return old.pop();
+  // set the isolate state
+  isolate._state = new IsolateState(isolate, value, path, root);
+  return isolate;
 }
 
-ArrayIsolateProto.pop = function () {
-  return Update(this, 'updateIn', [pop_]);
-};
-
-ArrayIsolateProto.unshift = function (/* values */) {
-  
-};
-
-ArrayIsolateProto.shift = function () {
-  
-};
-
-var IsolateProto = Object.create(null);
+var IsolateProto = Object.create(Iterable.prototype);
 
 /**
  * @class Isolate
@@ -84,30 +62,42 @@ function isIsolate(o) { return o instanceof Isolate; }
 
 var IsolateProto = Isolate.prototype;
 IsolateProto.constructor = Isolate;
-IsolateProto._listeners = null;
-IsolateProto._value = null;
-IsolateProto.Orchestrator = null;
+IsolateProto._state = null;
 
 IsolateProto.toString = function () {
   return 'Isolate {' + isolateToString(this) + ' }';
 };
 
-/**
- * @method Isolate#equals(<value>)
- * @returns {boolean}
- */
-IsolateProto.equals = function equals(that) {
-  if (this === that) return true;
+function Prox(proto) {
+  this.proto = proto;
+}
 
-  var value = this._root.value.getIn(this._keyPath);
-  return value === that || (!!value.equals && value.equals(that));
+Prox.prototype.method = function (method) {
+  this.proto[method] = function () {
+    return this._state[method](arguments);
+  };
+  return this;
 };
+
+new Prox(IsolateProto)
+  .method('equals')
+  .method('has')
+  .method('contains')
+  .method('first')
+  .method('last')
+  .method('merge')
+  .method('mergeWith')
+  .method('mergeIn')
+  .method('mergeDeep')
+  .method('mergeDeepWith')
+  .method('mergeDeepIn')
+  .method('withMutations');
 
 /**
  * @method Isolate#get(<string>)
  */
 IsolateProto.get = function get(key, notSetValue) {
-  return this.getIn((key == null ? [] : [key]), notSetValue);
+  return this._state.get(key, notSetValue);
 };
 
 /**
@@ -118,93 +108,87 @@ function getIn(path, notSetValue) {
   if (!Array.isArray(path))
     throw new Error('path must be an array');
 
-  if (path.length === 0) return this;
-
-  path = this._keyPath.concat(path);
-  
-  var root = this._root;
-  var rootValue = root._value;
-  var value = isIterable(rootValue) 
-    ? rootValue.getIn(path, notSetValue)
-    : rootValue;
-
-  return fromJS(value, root, path);
+  return this._state.getIn(path, notSetValue);
 }
+
+function subFrom_(state, path, notSetValue) {
+  var value = state.getIn(path, notSetValue);
+  path = state.keyPath.concat(path);
+  return isolateFromJS(value, state.root, path);
+}
+
+IsolateProto.isolateFrom
+= IsolateProto.getFrom
+= IsolateProto.subFrom
+= IsolateProto['in']
+= function subFrom(path, notSetValue) {
+  if (!Array.isArray(path))
+    throw new Error('path must be an array');
+
+  if (path.length === 0) return this;
+  return subFrom_(this._state, path, notSetValue);
+};
+
+IsolateProto.isolate
+= IsolateProto.from
+= IsolateProto.sub
+= function sub(path, notSetValue) {
+  if (!path && path !== 0) return this;
+  return subFrom_(this._state, [path], notSetValue);
+};
 
 /**
  * @private
  */
 function isFunc(obj) { return 'function' === typeof obj; }
+function isStrOrNum(val) {
+  return 'string' === typeof val || 'number' === typeof val;
+}
 
 IsolateProto.update
 = IsolateProto.set
-= function update() {
-  var path = [arguments[0]];
-
-  if (arguments.length === 2)
-    return this.updateIn(path, arguments[1]);
-  if (arguments.length > 2) 
-    return this.updateIn(path, arguments[1], arguments[2]);
+= function update(path, notSetValue, cb) {
+  if (isFunc(path)) {
+    cb = path;
+    path = [];
+  } else if (path == null || !isStrOrNum(path)) {
+    path = [];
+  } else {
+    path = [path];
+  }
+  
+  return this.updateIn(path, notSetValue, cb);
 };
 
 IsolateProto.updateIn
 = IsolateProto.setIn
-= function udpateIn() {
-  return Update(this, 'updateIn', arguments);
-};
+= function updateIn(path, notSetValue, cb) {
+  if ('function' === typeof path) {
+    cb = path;
+    path = [];
+  }
 
-//function createMerge()
+  if ('function' === typeof notSetValue) {
+    cb = notSetValue;
+    notSetValue = undefined;
+  }
 
-['merge', 'mergeWith', 'mergeIn', 'mergeDeep', 'mergeDeepWith', 'mergeDeepIn']
-.forEach(function (method) {
-  IsolateProto[method] = function mergeMethod() {
-    var args = arguments;
-    return Update(this, 'updateIn', [function () {
-      
-    }]);
-  };
-});
-
-/**
- * @method Isolate#withMutations(<Function>)
- */
-IsolateProto.withMutations = function withMutations(cb) {
-  return isFunc(cb) ? Update(this, 'withMutations', [cb]) : this;
+  return this._state.updateIn(path, notSetValue, cb);
 };
 
 /**
  * @method Isolate#addListener(<Function>)
  */
-IsolateProto.addListener
-= function addListener(cb) {
-  if (!this._listener) {
-    this._listener = new Listener(this._keyPath);
-    this._root._listeners.push(this._listener);
-  }
-
-  this._listener.handlers.push(cb);
+IsolateProto.addListener = function (cb) {
+  this._state.addListener(cb);
   return this;
 };
 
 /**
  * @method Isolate#removeListener(<Function>)
  */
-IsolateProto.removeListener 
-= function removeListener(cb) {
-  var listener = this._listener;
-
-  if (listener) {
-    var handlers = listener.handlers;
-    var i = handlers.indexOf(cb);
-    handlers.splice(i, 1);
-
-    if (handlers.length === 0) {
-      var rootListeners = this._root._listeners;
-      i = rootListeners.indexOf(listener);
-      rootListeners.splice(i, 0);
-      this._listener = null;
-    }
-  }
+IsolateProto.removeListener = function (cb) {
+  this._state.removeListener(cb);
   return this;
 };
 
@@ -216,8 +200,7 @@ IsolateProto.toJS
 = IsolateProto.valueOf
 = IsolateProto.deref
 = function deref(notSetValue) {
-  var value = this._root._value.getIn(this._keyPath, notSetValue);
-  return (value && value.toJS) ? value.toJS() : value;
+  return this._state.deref(notSetValue);
 };
 
 /**
@@ -289,9 +272,34 @@ function createItCallback(isolate, iterator) {
 /**
  * @private
  */
-function isolateToString(iso) {
-  var value = iso._value || iso._root.getIn(iso._keyPath);
+function isolateToString(state) {
+  var value = state.value || state.root.getIn(state.keyPath);
   if (value === undefined) value = 'undefined';
   else if (value === null) value = 'null';
   return value !== '' ? ' ' + value.toString() : '';
 }
+
+var ArrayIsolateProto = Object.create(Isolate.prototype);
+
+/**
+ * @class ArrayIsolate
+ */
+function ArrayIsolate(value, root, path) {
+  return Construct(ArrayIsolateProto, value, root, path);
+}
+ArrayIsolate.prototype = ArrayIsolateProto;
+
+ArrayIsolate.isArrayIsolate = function (o) {
+  return o instanceof ArrayIsolate;
+};
+ArrayIsolateProto.constructor = ArrayIsolate;
+
+ArrayIsolateProto.toString = function () {
+  return 'ArrayIsolate [' + isolateToString(this) + ' ]';
+};
+
+new Prox(ArrayIsolateProto)
+  .method('push')
+  .method('pop')
+  .method('unshift')
+  .method('shift');
